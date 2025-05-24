@@ -814,13 +814,12 @@ class RouteOptimizationApp:
             self.log_message(f"  Cluster composition: VF4={len(vf4_outlets)}, VF2={len(vf2_outlets)}.")
 
             # Split VF2 outlets into two groups (A and B)
-            vf2_sorted = vf2_outlets.copy()
+            # vf2_sorted = vf2_outlets.copy() # No longer needed as sort_values creates a copy by default if not inplace
             # With K-Means, radius splitting might not be as relevant as outlets are already spatially grouped.
-            # A random split or a more sophisticated spatial split *within* the K-Means cluster could be used.
-            # For simplicity, let's stick with random if K-Means is the primary clusterer.
-            vf2_sorted = vf2_sorted.sample(frac=1, random_state=42).reset_index(drop=True) # Shuffle ensures random groups
-            split_method = "random (post K-Means)"
-            self.log_message(f"  Splitting VF2 outlets randomly ({split_method}).")
+            # Change from random shuffling to sorting by latitude.
+            vf2_sorted = vf2_outlets.sort_values(by='latitude').reset_index(drop=True)
+            split_method = "sorted latitude"
+            self.log_message(f"  Splitting VF2 outlets by {split_method}.") # Updated log message
 
 
             num_vf2 = len(vf2_sorted)
@@ -941,34 +940,16 @@ class RouteOptimizationApp:
             self.queue.put(('error', f"{log_prefix}: Failed to prepare VRP locations: {e}"))
             return None
 
-        # Calculate Distance Matrix (Haversine distance in meters, integer)
-        distance_matrix = np.zeros((num_vrp_locations, num_vrp_locations), dtype=np.int64) # Use int64 for potentially large distances
-        max_dist_meters = 0
-        nan_distance_found = False
-        for i in range(num_vrp_locations):
-            for j in range(i, num_vrp_locations): # Optimize symmetric calculation
-                dist_meters = 999999999 # Use a large integer default for errors/NaNs
-                if i == j:
-                    dist_meters = 0
-                else:
-                    try:
-                        dist_km = haversine(vrp_locations[i, 0], vrp_locations[i, 1], vrp_locations[j, 0], vrp_locations[j, 1])
-                        if pd.isna(dist_km):
-                            nan_distance_found = True
-                            # Keep large default distance
-                        elif dist_km < 0: dist_meters = 0 # Safeguard
-                        else:
-                            dist_meters = int(dist_km * 1000) # Convert km to meters
-                            max_dist_meters = max(max_dist_meters, dist_meters)
-                    except Exception as haversine_err:
-                         # Catch potential errors in haversine call itself (e.g., invalid coords somehow missed)
-                         self.log_message(f"Warning ({log_prefix}): Error calculating haversine distance between node {i} and {j}: {haversine_err}")
-                         nan_distance_found = True
-                distance_matrix[i, j] = dist_meters
-                distance_matrix[j, i] = dist_meters # Symmetric matrix
-        if nan_distance_found:
-            self.log_message(f"Warning ({log_prefix}): Invalid distances (NaN or calculation error) encountered. Using large placeholder distance for these pairs.")
+        # Calculate Distance Matrix using the new helper method
+        distance_matrix, distance_method_name, max_dist_meters = self._calculate_distance_matrix(vrp_locations, log_prefix)
 
+        if distance_matrix is None: # Check if matrix calculation failed
+            self.log_message(f"ERROR ({log_prefix}): Distance matrix calculation failed. Cannot proceed with VRP.")
+            # _calculate_distance_matrix should log specific errors and queue user messages
+            return None
+
+        if distance_method_name == "Haversine":
+            self.log_message(f"Warning ({log_prefix}): Distance calculations are based on the Haversine formula (as-the-crow-flies) and do not represent actual road network travel. Resulting routes may be suboptimal.")
 
         # --- 4. Initialize OR-Tools Routing Model ---
         try:
@@ -1954,58 +1935,68 @@ class RouteOptimizationApp:
 
             # --- Check if schedule results exist and contain actual route data for export ---
             schedule_is_ready_for_export = False
-            if isinstance(self.schedule, dict) and self.schedule: # Check if dict and non-empty
-                try:
-                    # More robust check using explicit loops and type checks
-                    for rep_name, entries in self.schedule.items(): # Use .items() explicitely
-                        # Check if entries is a list
-                        if not isinstance(entries, list):
-                            self.log_message(f"Warning in enable_buttons: Schedule entry for '{rep_name}' is not a list (type: {type(entries)}). Skipping check for this rep.")
-                            continue # Skip to next representative
+            self.log_message("Debug: Starting schedule readiness check for export...")
+            try:
+                if not isinstance(self.schedule, dict):
+                    self.log_message(f"Warning (enable_buttons): self.schedule is not a dictionary (type: {type(self.schedule)}). Export disabled.")
+                elif not self.schedule: # Check if dict is empty
+                    self.log_message("Debug (enable_buttons): self.schedule is an empty dictionary. Export disabled.")
+                else:
+                    self.log_message(f"Debug (enable_buttons): self.schedule is a dictionary with {len(self.schedule)} rep(s). Iterating...")
+                    for rep_name, rep_schedule_entries in self.schedule.items():
+                        if not isinstance(rep_schedule_entries, list):
+                            self.log_message(f"Warning (enable_buttons): Schedule for rep '{rep_name}' is not a list (type: {type(rep_schedule_entries)}). Skipping rep for export check.")
+                            continue # Move to the next representative's schedule
 
-                        # Check if the list is non-empty
-                        if not entries:
-                            continue # Skip empty lists
+                        if not rep_schedule_entries: # Check if list of entries is empty
+                            self.log_message(f"Debug (enable_buttons): Rep '{rep_name}' has an empty list of schedule entries. Skipping.")
+                            continue
 
-                        # Check items within the list
-                        for day_info in entries:
-                            # Check if day_info is a dictionary
-                            if not isinstance(day_info, dict):
-                                self.log_message(f"Warning in enable_buttons: Schedule item for '{rep_name}' is not a dict (type: {type(day_info)}). Skipping check for this item.")
-                                continue # Skip to next item in the list
+                        # self.log_message(f"Debug (enable_buttons): Rep '{rep_name}' has {len(rep_schedule_entries)} day entries. Checking entries...")
+                        for day_entry_index, day_entry in enumerate(rep_schedule_entries):
+                            if not isinstance(day_entry, dict):
+                                self.log_message(f"Warning (enable_buttons): Day entry at index {day_entry_index} for rep '{rep_name}' is not a dictionary (type: {type(day_entry)}). Skipping entry.")
+                                continue # Move to the next day's entry
 
-                            # Check if 'RouteDF' exists, is a DataFrame, and is not empty
-                            route_df = day_info.get('RouteDF')
-                            if isinstance(route_df, pd.DataFrame) and not route_df.empty:
-                                schedule_is_ready_for_export = True
-                                break # Found one valid route DF, this rep's data is exportable
+                            route_df = day_entry.get('RouteDF') # Use .get() for safer access
+                            if route_df is None: # Check if key 'RouteDF' exists
+                                self.log_message(f"Warning (enable_buttons): Day entry at index {day_entry_index} for rep '{rep_name}' is missing 'RouteDF' key. Skipping entry.")
+                                continue
+
+                            if not isinstance(route_df, pd.DataFrame):
+                                self.log_message(f"Warning (enable_buttons): 'RouteDF' for day entry at index {day_entry_index} (rep '{rep_name}') is not a pandas DataFrame (type: {type(route_df)}). Skipping entry.")
+                                continue
+
+                            if route_df.empty:
+                                # self.log_message(f"Debug (enable_buttons): 'RouteDF' for day entry at index {day_entry_index} (rep '{rep_name}') is an empty DataFrame. Skipping this specific DF for export readiness.")
+                                continue # This specific DF is empty, but others might be valid
+
+                            # If we reach here, we found a valid, non-empty DataFrame
+                            schedule_is_ready_for_export = True
+                            self.log_message(f"Debug (enable_buttons): Found valid, non-empty RouteDF for rep '{rep_name}', day entry index {day_entry_index}. Schedule is ready for export.")
+                            break # Exit inner loop (day_entries)
                         if schedule_is_ready_for_export:
-                             break # Found valid data for at least one rep, schedule is exportable
+                            break # Exit outer loop (reps)
 
-                except AttributeError as ae:
-                     # Catch the specific error if it happens here
-                     self.log_message(f"ERROR (AttributeError: {ae}) during schedule check in enable_buttons. Schedule structure might be inconsistent.")
-                     # Log details to help debug the structure
-                     self.log_message(f"Current schedule type: {type(self.schedule)}")
-                     # Safely try to log types of variables in the loop if they exist
-                     entries_type = type(entries) if 'entries' in locals() else 'N/A'
-                     day_info_type = type(day_info) if 'day_info' in locals() else 'N/A'
-                     self.log_message(f"Problematic entry type (if available): {entries_type}")
-                     self.log_message(f"Problematic day_info type (if available): {day_info_type}")
-                     self.log_message(f"Traceback:\n{traceback.format_exc()}")
-                     schedule_is_ready_for_export = False # Assume not ready on error
-                except Exception as e_sched_check_enable:
-                    # Catch any other unexpected errors during the check
-                    self.log_message(f"ERROR ({type(e_sched_check_enable).__name__}) during schedule check in enable_buttons: {e_sched_check_enable}")
-                    self.log_message(f"Traceback:\n{traceback.format_exc()}")
-                    schedule_is_ready_for_export = False # Assume not ready on error
+            except (AttributeError, KeyError, TypeError) as e_struct:
+                self.log_message(f"ERROR (enable_buttons): Exception ({type(e_struct).__name__}: {e_struct}) during schedule structure check. Assuming schedule not ready for export.")
+                self.log_message(f"Traceback for schedule check error:\n{traceback.format_exc()}")
+                schedule_is_ready_for_export = False # Ensure it's False on such errors
+            except Exception as e_generic_check:
+                # Catch any other unexpected errors during the check
+                self.log_message(f"UNEXPECTED ERROR (enable_buttons): Exception ({type(e_generic_check).__name__}: {e_generic_check}) during schedule check. Assuming schedule not ready.")
+                self.log_message(f"Traceback for generic schedule check error:\n{traceback.format_exc()}")
+                schedule_is_ready_for_export = False
 
             # Determine state for Export button
             export_state = 'normal' if params_are_valid and data_is_ready and schedule_is_ready_for_export else 'disabled'
             if hasattr(self, 'export_button') and self.export_button.winfo_exists():
                  if self.export_button.cget('state') != export_state:
                     self.export_button.config(state=export_state)
-            self.log_message(f"Debug: Export button state set to '{export_state}' (Params Valid: {params_are_valid}, Data Ready: {data_is_ready}, Schedule Ready: {schedule_is_ready_for_export})")
+
+            # Enhanced logging for final states
+            self.log_message(f"Debug (enable_buttons) Final States: Params Valid={params_are_valid}, Data Ready={data_is_ready}, Schedule Ready for Export={schedule_is_ready_for_export}")
+            self.log_message(f"Debug (enable_buttons): Optimize button state -> '{self.optimize_button.cget('state')}', Export button state -> '{export_state}'")
 
         except tk.TclError:
             # Can potentially happen if widgets are destroyed during state update (e.g., closing app)
